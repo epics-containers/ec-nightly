@@ -1,9 +1,9 @@
-"""Generic, parametrised, read-only smoke checks against blueapi's REST API.
+"""Generic, parametrised smoke checks against blueapi's REST API.
 
 Routes are those of blueapi 1.17 (``blueapi/service/main.py``): ``/healthz`` is
-open; ``/api/v1/environment``, ``/api/v1/plans``, ``/api/v1/devices`` and
-``/api/v1/worker/state`` need a bearer token when blueapi has OIDC configured.
-Only GET requests are made against blueapi.
+open; everything under ``/api/v1`` needs a bearer token when blueapi has OIDC
+configured. All checks only GET from blueapi, except ``scan``, which runs a
+plan (see :func:`check_scan`) and is skipped unless ``SCAN_PLAN`` is set.
 """
 
 from __future__ import annotations
@@ -21,6 +21,10 @@ from .config import Config
 log = logging.getLogger(__name__)
 
 PASS, FAIL, SKIP = "pass", "fail", "skip"
+
+# the scan check's clock and poll sleep (module level so tests can patch them)
+monotonic = time.monotonic
+pause = time.sleep
 
 
 class CheckError(Exception):
@@ -41,9 +45,18 @@ class Context:
     The token is held only in memory and is never logged or reported.
     """
 
-    def __init__(self, config: Config, client: httpx.Client):
+    def __init__(
+        self,
+        config: Config,
+        client: httpx.Client,
+        clock: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ):
         self.config = config
         self.client = client
+        # looked up at construction so tests can replace them
+        self.clock = clock or monotonic
+        self.sleep = sleep or pause
         self._token: str | None = None
         self._token_error: str | None = None
         self.token_expires_in: Any = None
@@ -92,7 +105,14 @@ class Context:
         self.token_expires_in = body.get("expires_in")
         return token
 
-    def get_json(self, path: str, authenticated: bool = True) -> Any:
+    def request(
+        self,
+        method: str,
+        path: str,
+        json: Any = None,
+        authenticated: bool = True,
+    ) -> httpx.Response:
+        """Send a request to blueapi; 401/403 and transport errors raise."""
         headers = {"Accept": "application/json"}
         if authenticated:
             token = self.token()
@@ -100,19 +120,56 @@ class Context:
                 headers["Authorization"] = f"Bearer {token}"
         url = f"{self.config.blueapi_url}{path}"
         try:
-            response = self.client.get(url, headers=headers)
+            response = self.client.request(method, url, headers=headers, json=json)
         except httpx.HTTPError as error:
             raise CheckError(
-                f"GET {url} failed: {type(error).__name__}: {error}"
+                f"{method} {url} failed: {type(error).__name__}: {error}"
             ) from None
         if response.status_code in (401, 403):
-            raise CheckError(f"GET {path} not authorised (HTTP {response.status_code})")
+            raise CheckError(
+                f"{method} {path} not authorised (HTTP {response.status_code})"
+            )
+        return response
+
+    def get_json(self, path: str, authenticated: bool = True) -> Any:
+        response = self.request("GET", path, authenticated=authenticated)
         if response.status_code != 200:
             raise CheckError(f"GET {path} returned HTTP {response.status_code}")
-        try:
-            return response.json()
-        except ValueError:
-            raise CheckError(f"GET {path} did not return JSON") from None
+        return _json(response, f"GET {path}")
+
+
+def _json(response: httpx.Response, what: str) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        raise CheckError(f"{what} did not return JSON") from None
+
+
+def _detail(response: httpx.Response, limit: int = 300) -> str:
+    """blueapi's error ``detail`` (FastAPI), shortened, for failure messages.
+
+    For a 422 this is the list of pydantic errors on the plan parameters; only
+    location and message are kept (not the echoed input).
+    """
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return ""
+    if isinstance(detail, list):
+        parts = []
+        for err in detail:
+            if isinstance(err, dict):
+                loc = ".".join(str(p) for p in err.get("loc", []))
+                parts.append(f"{loc}: {err.get('msg')}")
+        detail = "; ".join(dict.fromkeys(parts))  # blueapi repeats some errors
+    if not isinstance(detail, str) or not detail:
+        return ""
+    return ": " + _shorten(detail, limit)
+
+
+def _shorten(text: str, limit: int = 300) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def _oauth_error(response: httpx.Response) -> str:
@@ -200,6 +257,111 @@ def check_worker(ctx: Context) -> str:
     return f"worker state {state}"
 
 
+def check_scan(ctx: Context) -> str | None:
+    """Run SCAN_PLAN with SCAN_PARAMS on the worker; it must succeed in time.
+
+    POST /api/v1/tasks, PUT /api/v1/worker/task, then poll
+    GET /api/v1/tasks/{id} until complete. On timeout, our own task is aborted.
+    """
+    cfg = ctx.config
+    if not cfg.scan_plan:
+        return None
+    plan = cfg.scan_plan
+
+    # 1. submit: blueapi validates the plan name and parameters here
+    response = ctx.request(
+        "POST",
+        "/api/v1/tasks",
+        json={
+            "name": plan,
+            "params": dict(cfg.scan_params),
+            "instrument_session": cfg.scan_instrument_session,
+        },
+    )
+    if response.status_code == 404:
+        raise CheckError(f"plan {plan!r} not found (HTTP 404)")
+    if response.status_code == 422:
+        raise CheckError(f"plan {plan!r} rejected its parameters{_detail(response)}")
+    if response.status_code != 201:
+        raise CheckError(
+            f"submitting plan {plan!r} returned HTTP {response.status_code}"
+            f"{_detail(response)}"
+        )
+    body = _json(response, "POST /api/v1/tasks")
+    task_id = body.get("task_id") if isinstance(body, dict) else None
+    if not isinstance(task_id, str) or not task_id:
+        raise CheckError("POST /api/v1/tasks response has no task_id")
+    log.info("scan: submitted %s as task %s", plan, task_id)
+
+    # 2. start it; 409 means the worker is busy with something else
+    response = ctx.request("PUT", "/api/v1/worker/task", json={"task_id": task_id})
+    if response.status_code != 200:
+        _forget(ctx, task_id)
+        if response.status_code == 409:
+            raise CheckError(f"worker busy, could not start {plan!r} (HTTP 409)")
+        raise CheckError(
+            f"starting task returned HTTP {response.status_code}{_detail(response)}"
+        )
+
+    # 3. wait for it to complete
+    started = ctx.clock()
+    deadline = started + cfg.scan_timeout
+    while True:
+        task = ctx.get_json(f"/api/v1/tasks/{task_id}")
+        if not isinstance(task, dict):
+            raise CheckError("GET /api/v1/tasks/{id} returned unexpected JSON")
+        if task.get("is_complete") is True:
+            break
+        if ctx.clock() >= deadline:
+            raise CheckError(
+                f"plan {plan!r} did not complete within {cfg.scan_timeout:g}s"
+                f"{_abort(ctx, task_id)}"
+            )
+        ctx.sleep(cfg.scan_poll_interval)
+    elapsed = ctx.clock() - started
+
+    # 4. judge the final state
+    outcome = task.get("outcome")
+    errors = task.get("errors") or []
+    if not isinstance(outcome, dict) or outcome.get("outcome") != "success":
+        if isinstance(outcome, dict) and outcome.get("outcome") == "error":
+            why = f"{outcome.get('type')}: {outcome.get('message')}"
+        else:
+            why = f"no success outcome ({outcome!r})"
+        raise CheckError(f"plan {plan!r} failed: {_shorten(str(why))}")
+    if errors:
+        raise CheckError(
+            f"plan {plan!r} reported {len(errors)} error(s): {_shorten(str(errors[0]))}"
+        )
+    return f"plan {plan} completed successfully in {elapsed:.1f}s (task {task_id})"
+
+
+def _forget(ctx: Context, task_id: str) -> None:
+    """Best effort: delete a task we submitted but could not start."""
+    try:
+        ctx.request("DELETE", f"/api/v1/tasks/{task_id}")
+    except CheckError as error:
+        log.warning("scan: could not delete unstarted task %s: %s", task_id, error)
+
+
+def _abort(ctx: Context, task_id: str) -> str:
+    """Abort the worker's active task, but only if it is the one we started."""
+    try:
+        active = ctx.get_json("/api/v1/worker/task")
+        if not isinstance(active, dict) or active.get("task_id") != task_id:
+            return "; it is no longer the active task, not aborted"
+        response = ctx.request(
+            "PUT",
+            "/api/v1/worker/state",
+            json={"new_state": "ABORTING", "reason": "ec-nightly scan timeout"},
+        )
+    except CheckError as error:
+        return f"; abort failed: {error}"
+    if response.status_code != 202:
+        return f"; abort returned HTTP {response.status_code}{_detail(response)}"
+    return "; aborted it"
+
+
 CHECKS: dict[str, Callable[[Context], str | None]] = {
     "token": check_token,
     "health": check_health,
@@ -207,6 +369,13 @@ CHECKS: dict[str, Callable[[Context], str | None]] = {
     "plans": check_plans,
     "devices": check_devices,
     "worker": check_worker,
+    "scan": check_scan,
+}
+
+# Why a check that returned None was skipped.
+SKIP_REASONS = {
+    "token": "skipped: CLIENT_ID/CLIENT_SECRET not set, unauthenticated",
+    "scan": "skipped: SCAN_PLAN not set",
 }
 
 
@@ -216,7 +385,7 @@ def run_check(name: str, ctx: Context) -> Result:
         message = CHECKS[name](ctx)
         status = SKIP if message is None else PASS
         if message is None:
-            message = "skipped: CLIENT_ID/CLIENT_SECRET not set, unauthenticated"
+            message = SKIP_REASONS.get(name, "skipped")
     except CheckError as error:
         status, message = FAIL, str(error)
     except Exception as error:  # a bug or surprise response must not hide others

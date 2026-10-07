@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from conftest import BLUEAPI, CLIENT_SECRET, TOKEN, FakeBlueapi
+from conftest import BLUEAPI, CLIENT_SECRET, TOKEN, TOKEN_URL, FakeBlueapi
 from ec_nightly.__main__ import run_checks
 from ec_nightly.checks import CHECKS
 from ec_nightly.config import DEFAULT_TOKEN_URL, Config
@@ -50,14 +50,20 @@ def test_all_pass(config, fake, caplog, capsys):
     assert list(statuses(config)) == list(CHECKS)
 
     # one token request, sent client_secret_basic, and bearer on secure routes
-    token_requests = [r for r in fake.requests if r.method == "POST"]
+    token_requests = [r for r in fake.requests if str(r.url) == TOKEN_URL]
     assert len(token_requests) == 1
     for request in fake.requests:
         if request.url.path.startswith("/api/v1/"):
             assert request.headers["Authorization"] == f"Bearer {TOKEN}"
         if request.url.path == "/healthz":
             assert "Authorization" not in request.headers
-    assert {r.method for r in fake.requests} == {"GET", "POST"}
+    # only the scan check writes to blueapi: submit and start one task
+    writes = [
+        (r.method, r.url.path)
+        for r in fake.requests
+        if r.method != "GET" and str(r.url) != TOKEN_URL
+    ]
+    assert writes == [("POST", "/api/v1/tasks"), ("PUT", "/api/v1/worker/task")]
 
     # never leak secrets anywhere
     out = caplog.text + capsys.readouterr().out
@@ -71,7 +77,7 @@ def test_junit_report(config, fake):
     assert run_checks([], config, fake.transport) == 1
     (path,) = Path(config.report_dir).glob("*/nightly-smoke/report.xml")
     suite = ET.parse(path).getroot()
-    assert suite.get("tests") == "6"
+    assert suite.get("tests") == str(len(CHECKS))
     assert suite.get("failures") == "1"
     failure = suite.find("testcase[@name='devices']/failure")
     assert failure is not None
@@ -122,7 +128,7 @@ def test_bad_credentials(config, fake, caplog, capsys):
     result = statuses(config)
     assert result["token"] == "fail"
     assert result["health"] == "pass"
-    for name in ("environment", "plans", "devices", "worker"):
+    for name in ("environment", "plans", "devices", "worker", "scan"):
         assert result[name] == "fail"
     # the token endpoint is tried once, its error_description is not echoed
     assert sum(r.method == "POST" for r in fake.requests) == 1
@@ -185,7 +191,15 @@ def test_unwritable_report_dir(env, fake, tmp_path):
     assert run_checks([], Config.from_env(env), fake.transport) == 1
 
 
-def test_fake_rejects_writes():
-    # guard: the checks only ever GET from blueapi
-    fake = FakeBlueapi()
-    assert fake(httpx.Request("POST", BLUEAPI + "/api/v1/tasks")).status_code == 405
+def test_read_only_without_scan_plan(env, fake):
+    # guard: with SCAN_PLAN unset the checks only ever GET from blueapi
+    del env["SCAN_PLAN"]
+    config = Config.from_env(env)
+    assert run_checks([], config, fake.transport) == 0
+    assert statuses(config)["scan"] == "skip"
+    assert {r.method for r in fake.requests if str(r.url) != TOKEN_URL} == {"GET"}
+
+
+def test_fake_rejects_unknown_writes():
+    fake = FakeBlueapi(require_auth=False)
+    assert fake(httpx.Request("POST", BLUEAPI + "/api/v1/plans")).status_code == 405

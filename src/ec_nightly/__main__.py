@@ -60,7 +60,8 @@ def main(args: Sequence[str] | None = None) -> None:
     """Argument parser for the CLI."""
     parser = ArgumentParser(
         prog="ec-nightly",
-        description="Read-only smoke checks against a blueapi instance. "
+        description="Smoke checks against a blueapi instance: read-only, plus an "
+        "optional plan run (the scan check, only when SCAN_PLAN is set). "
         "Configured by environment variables, see README.",
     )
     parser.add_argument("-v", "--version", action="version", version=__version__)

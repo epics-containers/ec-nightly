@@ -15,7 +15,15 @@ def test_cli_version():
 def test_list(capsys):
     main(["list"])
     out = capsys.readouterr().out
-    for name in ("token", "health", "environment", "plans", "devices", "worker"):
+    for name in (
+        "token",
+        "health",
+        "environment",
+        "plans",
+        "devices",
+        "worker",
+        "scan",
+    ):
         assert name in out
 
 
