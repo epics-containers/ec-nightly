@@ -106,7 +106,7 @@ def test_scan_skipped_without_plan(env, fake):
 
 def test_scan_plan_error(config, fake):
     # as blueapi 1.17 reports a plan that raised (seen against a real server)
-    message = "FileNotFoundError(\"Path /tmp/ doesn't exist or not writable!\")"
+    message = 'FileNotFoundError("Path /tmp/ doesn\'t exist or not writable!")'
     fake.outcome = {"outcome": "error", "type": "FailedStatus", "message": message}
     fake.errors = [message]
     assert run_checks(["scan"], config, fake.transport) == 1
