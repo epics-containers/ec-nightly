@@ -46,6 +46,7 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
           tags: |
             type=ref,event=tag
             # never move :latest for pre-release tags such as 0.1.0-beta.1
