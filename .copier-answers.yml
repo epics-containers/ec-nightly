@@ -1,11 +1,8 @@
 # Changes here will be overwritten by Copier
-_commit: 5.4.0
+_commit: 5.5.0
 _src_path: https://github.com/DiamondLightSource/python-copier-template.git
 author_email: gilesknap@gmail.com
 author_name: Giles Knap
-component_lifecycle: experimental
-component_owner: group:default/beamline-controls
-component_type: service
 description: Nightly read-only smoke checks against a blueapi instance
 distribution_name: ec-nightly
 docker: true
